@@ -1,0 +1,41 @@
+/* Fade out animation */
+@keyframes fadeOut {
+  0% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.animate-fade-out {
+  animation: fadeOut 2s ease-out forwards;
+  animation-delay: 1s;
+}
+
+/* Pulse animation (already in Tailwind, but added for reference) */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.animate-pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Scale animation */
+@keyframes scale {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+.animate-scale {
+  animation: scale 2s ease-in-out infinite;
+}
+
+/* Prevent dark mode flickering on page load */
+.transition-colors, 
+.transition-all {
+  transition-duration: 300ms;
+}
+
+html.dark {
+  color-scheme: dark;
+}

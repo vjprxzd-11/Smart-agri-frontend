@@ -1,0 +1,581 @@
+import { io, Socket } from 'socket.io-client';
+import { SensorData, PlantType, ControlAction, Alert, ReservoirLevels, ArduinoStatus } from '../types';
+
+// Utility function to safely convert values to numbers
+const safeNumber = (value: any, defaultValue: number = 0): number => {
+  if (value === null || value === undefined || value === '') {
+    return defaultValue;
+  }
+  const num = Number(value);
+  return isNaN(num) ? defaultValue : num;
+};
+
+// Utility function to validate and process sensor data from ESP32 devices
+const validateSensorData = (data: any, deviceId: string = '', plantType: PlantType = 'level1'): SensorData => {
+  const now = new Date().toISOString();
+  
+  // Extract NPK values properly from nested structure or direct values
+  let nitrogen = 0, phosphorus = 0, potassium = 0;
+  
+  if (data.npk) {
+    nitrogen = safeNumber(data.npk.N, 0);
+    phosphorus = safeNumber(data.npk.P, 0);
+    potassium = safeNumber(data.npk.K, 0);
+  } else {
+    nitrogen = safeNumber(data.nitrogen, 0);
+    phosphorus = safeNumber(data.phosphorus, 0);
+    potassium = safeNumber(data.potassium, 0);
+  }
+  
+  // Use moisture_percent or soil_moisture_percent instead of raw moisture
+  let moisturePercent = 0;
+  if (data.moisture_percent !== undefined) {
+    moisturePercent = safeNumber(data.moisture_percent, 0);
+  } else if (data.soil_moisture_percent !== undefined) {
+    moisturePercent = safeNumber(data.soil_moisture_percent, 0);
+  } else {
+    // Fallback to raw moisture if percentage not available
+    moisturePercent = safeNumber(data.moisture, 0);
+  }
+  
+  // Extract sunlight/lux values
+  let sunlightValue = 0;
+  if (data.lux !== undefined) {
+    sunlightValue = safeNumber(data.lux, 0);
+  } else if (data.lightLevel !== undefined) {
+    sunlightValue = safeNumber(data.lightLevel, 0);
+  } else if (data.ldr !== undefined) {
+    sunlightValue = safeNumber(data.ldr, 0);
+  }
+  
+  return {
+    // Temperature and humidity from ESP32_1 for both levels
+    temperature: safeNumber(data?.temperature, 20),
+    humidity: safeNumber(data?.humidity, 50),
+    
+    // Device-specific data - use percentage values
+    moisture: moisturePercent, // Use percentage value
+    sunlight: sunlightValue,
+    nitrogen: nitrogen,
+    phosphorus: phosphorus,
+    potassium: potassium,
+    
+    // Reservoir levels
+    waterLevel: safeNumber(data?.waterLevelPercent || data?.waterLevel, 0),
+    fertilizerLevel: safeNumber(data?.fertilizer_level || data?.fertilizerLevel, 0),
+    
+    timestamp: data?.timestamp || now,
+    deviceId: deviceId,
+  };
+};
+
+class ArduinoService {
+  private socket: Socket | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
+  private listeners: Map<string, Function[]> = new Map();
+  private connected = false;
+  private plantType: PlantType = 'level1';
+  private wateringActive = false;
+  private lightActive = false;
+  private backendUrl = import.meta.env.VITE_BACKEND_URL || 'https://smart-agri-backend-ysjs.onrender.com';
+  private retryDelay = 5000;
+  private currentSensorData: Record<string, SensorData> = {};
+  private currentReservoirLevels: ReservoirLevels = { 
+    water: 75, 
+    waterCm: 15,
+    fertilizer: 60, 
+    fertilizerCm: 12 
+  };
+  private connectionTimeout: NodeJS.Timeout | null = null;
+  private historicalData: Record<string, SensorData[]> = {
+    level1: [],
+    level2: []
+  };
+
+  public async connect(): Promise<boolean> {
+    // Clear any existing connection timeout
+    if (this.connectionTimeout) {
+      clearTimeout(this.connectionTimeout);
+      this.connectionTimeout = null;
+    }
+
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.warn(`Max reconnection attempts (${this.maxReconnectAttempts}) reached. Please check backend server.`);
+      this.emit('error', { 
+        message: `Unable to connect to backend server after ${this.maxReconnectAttempts} attempts. Please check if the server is running.`,
+        details: `Backend URL: ${this.backendUrl}`
+      });
+      return false;
+    }
+
+    try {
+      console.log(`Attempting to connect to backend at ${this.backendUrl} (attempt ${this.reconnectAttempts + 1}/${this.maxReconnectAttempts})`);
+      
+      this.socket = io(this.backendUrl, {
+        transports: ['websocket', 'polling'],
+        timeout: 15000,
+        reconnection: true,
+        reconnectionAttempts: 3,
+        reconnectionDelay: 3000,
+        forceNew: true,
+      });
+
+      this.setupSocketListeners();
+
+      return new Promise((resolve) => {
+        if (!this.socket) {
+          resolve(false);
+          return;
+        }
+
+        // Set a connection timeout
+        this.connectionTimeout = setTimeout(() => {
+          console.warn('Connection timeout reached');
+          if (this.socket && !this.connected) {
+            this.socket.disconnect();
+            this.handleConnectionError(new Error('Connection timeout'));
+            resolve(false);
+          }
+        }, 20000);
+
+        this.socket.on('connect', () => {
+          console.log('Successfully connected to backend via WebSocket');
+          this.connected = true;
+          this.reconnectAttempts = 0;
+          
+          if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+            this.connectionTimeout = null;
+          }
+          
+          this.emit('connection', { connected: true });
+          
+          // Request initial data for both devices
+          this.socket?.emit('requestInitialData', { 
+            plantType: this.plantType,
+            deviceIds: ['esp32_1', 'esp32_2']
+          });
+          
+          // Emit success alert
+          this.emit('alert', {
+            id: Date.now().toString(),
+            type: 'success',
+            message: 'Successfully connected to backend server',
+            timestamp: new Date().toISOString(),
+            read: false,
+          });
+          
+          resolve(true);
+        });
+
+        this.socket.on('connect_error', (error) => {
+          console.warn('WebSocket connection error:', error.message || error);
+          if (this.connectionTimeout) {
+            clearTimeout(this.connectionTimeout);
+            this.connectionTimeout = null;
+          }
+          this.handleConnectionError(error);
+          resolve(false);
+        });
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.warn('Connection error:', errorMessage);
+      this.handleConnectionError(error);
+      return false;
+    }
+  }
+
+  private setupSocketListeners(): void {
+    if (!this.socket) return;
+
+    // Handle initial data from both ESP32 devices
+    this.socket.on('initData', (data) => {
+      console.log('Initial sensor data received:', data);
+      
+      // Process data from both devices
+      if (data.sensorData) {
+        Object.keys(data.sensorData).forEach(deviceId => {
+          const deviceData = data.sensorData[deviceId];
+          if (deviceData) {
+            this.currentSensorData[deviceId] = validateSensorData(deviceData, deviceId, this.plantType);
+          }
+        });
+        
+        // Emit data for current plant type
+        this.emitCurrentPlantData();
+      }
+      
+      // Process reservoir levels
+      if (data.reservoirLevels) {
+        this.currentReservoirLevels = {
+          water: safeNumber(data.reservoirLevels.water, 75),
+          waterCm: safeNumber(data.reservoirLevels.waterCm, 15),
+          fertilizer: safeNumber(data.reservoirLevels.fertilizer, 60),
+          fertilizerCm: safeNumber(data.reservoirLevels.fertilizerCm, 12),
+        };
+        this.emit('reservoir', this.currentReservoirLevels);
+      }
+      
+      // Process control states
+      this.wateringActive = Boolean(data.wateringActive);
+      this.lightActive = Boolean(data.lightActive);
+    });
+
+    // Handle real-time data updates from specific devices
+    this.socket.on('dataUpdate', (data) => {
+      console.log('New sensor data received:', data);
+      
+      if (data.deviceId && data.data) {
+        // Store data from the specific device
+        this.currentSensorData[data.deviceId] = validateSensorData(data.data, data.deviceId, data.plantType);
+        
+        // Update reservoir levels from device data
+        if (data.deviceId === 'esp32_1' && data.data.waterLevelPercent !== undefined) {
+          this.currentReservoirLevels.water = safeNumber(data.data.waterLevelPercent, this.currentReservoirLevels.water);
+          this.currentReservoirLevels.waterCm = Math.round(this.currentReservoirLevels.water * 0.2);
+        }
+        
+        if (data.deviceId === 'esp32_2' && data.data.fertilizer_level !== undefined) {
+          this.currentReservoirLevels.fertilizer = safeNumber(data.data.fertilizer_level, this.currentReservoirLevels.fertilizer);
+          this.currentReservoirLevels.fertilizerCm = Math.round(this.currentReservoirLevels.fertilizer * 0.2);
+        }
+        
+        // Emit updated reservoir levels
+        this.emit('reservoir', this.currentReservoirLevels);
+        
+        // Add to historical data
+        const plantType = data.plantType || (data.deviceId === 'esp32_1' ? 'level1' : 'level2');
+        if (!this.historicalData[plantType]) {
+          this.historicalData[plantType] = [];
+        }
+        this.historicalData[plantType].push(this.currentSensorData[data.deviceId]);
+        
+        // Keep only last 50 records
+        if (this.historicalData[plantType].length > 50) {
+          this.historicalData[plantType] = this.historicalData[plantType].slice(-50);
+        }
+        
+        // Emit combined data for current plant type
+        this.emitCurrentPlantData();
+      }
+      
+      // Update control states from device state
+      if (data.state) {
+        if (data.deviceId === 'esp32_1') {
+          this.wateringActive = Boolean(data.state.waterPump || data.state.pump);
+        }
+        const currentDeviceId = this.plantType === 'level1' ? 'esp32_1' : 'esp32_2';
+        if (data.deviceId === currentDeviceId) {
+          this.lightActive = Boolean(data.state.light || data.state.ledStatus);
+        }
+      }
+    });
+
+    // Handle reservoir level updates
+    this.socket.on('reservoirUpdate', (levels) => {
+      console.log('Reservoir levels updated:', levels);
+      
+      const validatedLevels = {
+        water: safeNumber(levels.water, this.currentReservoirLevels.water),
+        waterCm: safeNumber(levels.waterCm, this.currentReservoirLevels.waterCm),
+        fertilizer: safeNumber(levels.fertilizer, this.currentReservoirLevels.fertilizer),
+        fertilizerCm: safeNumber(levels.fertilizerCm, this.currentReservoirLevels.fertilizerCm),
+      };
+      
+      this.currentReservoirLevels = validatedLevels;
+      this.emit('reservoir', validatedLevels);
+    });
+
+    // Handle control action responses
+    this.socket.on('controlResponse', (response) => {
+      console.log('Control action response:', response);
+      
+      // Update local state based on response
+      if (response.action === 'water') {
+        this.wateringActive = Boolean(response.active);
+      } else if (response.action === 'light') {
+        this.lightActive = Boolean(response.active);
+      }
+
+      if (response.success) {
+        this.emit('controlSuccess', response);
+      } else {
+        this.emit('controlError', response);
+      }
+    });
+
+    // Handle alerts
+    this.socket.on('alert', (alert) => {
+      console.log('Alert received:', alert);
+      this.emit('alert', {
+        id: Date.now().toString(),
+        type: alert.type || 'info',
+        message: alert.message,
+        timestamp: new Date().toISOString(),
+        read: false,
+      });
+    });
+
+    // Handle test events
+    this.socket.on('testEvent', (data) => {
+      console.log('Test event received:', data);
+      this.emit('alert', {
+        id: Date.now().toString(),
+        type: 'info',
+        message: `Test event: ${data.message}`,
+        timestamp: new Date().toISOString(),
+        read: false,
+      });
+    });
+
+    // Handle disconnection
+    this.socket.on('disconnect', (reason) => {
+      console.log('WebSocket disconnected:', reason);
+      this.connected = false;
+      this.emit('connection', { connected: false });
+      
+      if (reason === 'io server disconnect') {
+        this.handleConnectionError(new Error('Server disconnected'));
+      }
+    });
+
+    // Handle reconnection
+    this.socket.on('reconnect', (attemptNumber) => {
+      console.log('WebSocket reconnected after', attemptNumber, 'attempts');
+      this.connected = true;
+      this.reconnectAttempts = 0;
+      this.emit('connection', { connected: true });
+      
+      // Request fresh data after reconnection
+      this.socket?.emit('requestInitialData', { 
+        plantType: this.plantType,
+        deviceIds: ['esp32_1', 'esp32_2']
+      });
+      
+      // Emit reconnection success alert
+      this.emit('alert', {
+        id: Date.now().toString(),
+        type: 'success',
+        message: 'Reconnected to backend server',
+        timestamp: new Date().toISOString(),
+        read: false,
+      });
+    });
+
+    this.socket.on('reconnect_error', (error) => {
+      console.warn('WebSocket reconnection error:', error.message || error);
+      this.handleConnectionError(error);
+    });
+  }
+
+  private emitCurrentPlantData(): void {
+    // Combine data from both devices based on the specifications
+    const esp32_1_data = this.currentSensorData['esp32_1'];
+    const esp32_2_data = this.currentSensorData['esp32_2'];
+    
+    if (!esp32_1_data && !esp32_2_data) return;
+    
+    let combinedData: SensorData;
+    
+    if (this.plantType === 'level1') {
+      // Level 1: Use ESP32_1 data for moisture, sunlight, NPK
+      // Temperature and humidity from ESP32_1
+      combinedData = {
+        temperature: esp32_1_data?.temperature || 20,
+        humidity: esp32_1_data?.humidity || 50,
+        moisture: esp32_1_data?.moisture || 0, // Now using percentage
+        sunlight: esp32_1_data?.sunlight || 0,
+        nitrogen: esp32_1_data?.nitrogen || 0,
+        phosphorus: esp32_1_data?.phosphorus || 0,
+        potassium: esp32_1_data?.potassium || 0,
+        waterLevel: esp32_1_data?.waterLevel || 0,
+        fertilizerLevel: esp32_2_data?.fertilizerLevel || 0,
+        timestamp: new Date().toISOString(),
+        deviceId: 'esp32_1'
+      };
+    } else {
+      // Level 2: Use ESP32_2 data for moisture, sunlight, NPK
+      // Temperature and humidity from ESP32_1
+      combinedData = {
+        temperature: esp32_1_data?.temperature || 20,
+        humidity: esp32_1_data?.humidity || 50,
+        moisture: esp32_2_data?.moisture || 0, // Now using percentage
+        sunlight: esp32_2_data?.sunlight || 0,
+        nitrogen: esp32_2_data?.nitrogen || 0,
+        phosphorus: esp32_2_data?.phosphorus || 0,
+        potassium: esp32_2_data?.potassium || 0,
+        waterLevel: esp32_1_data?.waterLevel || 0,
+        fertilizerLevel: esp32_2_data?.fertilizerLevel || 0,
+        timestamp: new Date().toISOString(),
+        deviceId: 'esp32_2'
+      };
+    }
+    
+    this.emit('data', combinedData);
+  }
+
+  private handleConnectionError(error: any): void {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    
+    this.connected = false;
+    this.emit('connection', { connected: false });
+
+    this.reconnectAttempts++;
+    
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      const backoffDelay = Math.min(this.retryDelay * Math.pow(1.5, this.reconnectAttempts - 1), 20000);
+      console.log(`Connection failed. Retrying in ${backoffDelay}ms... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+      
+      setTimeout(() => {
+        this.connect();
+      }, backoffDelay);
+    } else {
+      console.error('Max reconnection attempts reached');
+      this.emit('error', { 
+        message: `Failed to connect to backend after ${this.maxReconnectAttempts} attempts: ${errorMessage}`,
+        details: `Backend URL: ${this.backendUrl}. Please check if the server is running and accessible.`
+      });
+    }
+  }
+
+  public disconnect(): void {
+    this.connected = false;
+    this.reconnectAttempts = 0;
+    
+    if (this.connectionTimeout) {
+      clearTimeout(this.connectionTimeout);
+      this.connectionTimeout = null;
+    }
+    
+    if (this.socket) {
+      this.socket.disconnect();
+      this.socket = null;
+    }
+    
+    this.emit('connection', { connected: false });
+  }
+
+  public isConnected(): boolean {
+    return this.connected && this.socket?.connected === true;
+  }
+
+  public setActivePlant(type: PlantType): void {
+    this.plantType = type;
+    
+    if (this.socket && this.connected) {
+      // Notify backend about plant type change and request data from appropriate device
+      const deviceId = type === 'level1' ? 'esp32_1' : 'esp32_2';
+      this.socket.emit('setPlantType', { plantType: type, deviceId });
+      this.socket.emit('requestInitialData', { plantType: type, deviceId });
+    }
+    
+    // Emit current data for the new plant type
+    this.emitCurrentPlantData();
+  }
+
+  public async sendCommand(action: ControlAction): Promise<boolean> {
+    if (!this.connected || !this.socket) {
+      console.error('Not connected to backend');
+      this.emit('controlError', { 
+        action, 
+        success: false, 
+        message: 'Not connected to backend. Please check your connection.' 
+      });
+      return false;
+    }
+
+    try {
+      // Determine which device to send command to based on current plant type
+      const deviceId = this.plantType === 'level1' ? 'esp32_1' : 'esp32_2';
+      
+      // Map frontend actions to backend commands
+      const commandMap: Record<ControlAction, { command: string; value: string }> = {
+        water: { command: 'water_pump', value: this.wateringActive ? 'off' : 'on' },
+        light: { command: 'grow_light', value: this.lightActive ? 'off' : 'on' },
+        nutrients: { command: 'nutrient_pump', value: 'on' }
+      };
+
+      const { command, value } = commandMap[action];
+      
+      console.log(`Sending control command to ${deviceId}: ${command} = ${value}`);
+      
+      // Send control command via WebSocket
+      this.socket.emit('control', {
+        deviceId,
+        command,
+        value,
+        plantType: this.plantType
+      });
+
+      // For nutrients, it's always a one-time action
+      if (action === 'nutrients') {
+        setTimeout(() => {
+          this.emit('controlSuccess', { 
+            action, 
+            success: true, 
+            message: 'Nutrients added successfully' 
+          });
+        }, 1000);
+      }
+
+      return true;
+    } catch (error) {
+      console.error('Command error:', error);
+      this.emit('controlError', { 
+        action,
+        success: false,
+        message: `Failed to send command: ${error instanceof Error ? error.message : 'Unknown error'}`
+      });
+      return false;
+    }
+  }
+
+  public getReservoirLevels(): ReservoirLevels {
+    return this.currentReservoirLevels;
+  }
+
+  public async getHistoricalData(): Promise<SensorData[]> {
+    return this.historicalData[this.plantType] || [];
+  }
+
+  public isWateringActive(): boolean {
+    return this.wateringActive;
+  }
+
+  public isLightActive(): boolean {
+    return this.lightActive;
+  }
+
+  public on(event: string, callback: Function): void {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, []);
+    }
+    this.listeners.get(event)?.push(callback);
+  }
+
+  public off(event: string, callback: Function): void {
+    if (!this.listeners.has(event)) return;
+    
+    const callbacks = this.listeners.get(event);
+    if (callbacks) {
+      const index = callbacks.indexOf(callback);
+      if (index !== -1) {
+        callbacks.splice(index, 1);
+      }
+    }
+  }
+
+  private emit(event: string, data: any): void {
+    if (!this.listeners.has(event)) return;
+    
+    const callbacks = this.listeners.get(event);
+    if (callbacks) {
+      callbacks.forEach(callback => callback(data));
+    }
+  }
+}
+
+export const arduinoService = new ArduinoService();
+export default arduinoService;
